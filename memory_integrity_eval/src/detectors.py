@@ -1,10 +1,12 @@
 """
 Real Prompt Injection Detectors
 
-Three canonical detector implementations:
-1. HeuristicDetector - Pattern/keyword-based (baseline)
-2. TFIDFDetector    - TF-IDF + Logistic Regression (classical ML)
-3. DeBERTaDetector  - Fine-tuned DeBERTa v3 (protectai/deberta-v3-base-prompt-injection-v2)
+Five canonical detector implementations:
+1. HeuristicDetector        - Pattern/keyword-based (baseline)
+2. TFIDFDetector             - TF-IDF + Logistic Regression (classical ML)
+3. DeBERTaDetector           - Pre-trained DeBERTa v3 (protectai/deberta-v3-base-prompt-injection-v2)
+4. FineTunedDeBERTaDetector  - DeBERTa v3 fine-tuned on target dataset
+5. EnsembleDetector          - Weighted ensemble of TF-IDF + DeBERTa
 """
 
 import re
@@ -204,7 +206,7 @@ class TFIDFDetector:
 
 class DeBERTaDetector:
     """
-    Fine-tuned DeBERTa v3 prompt injection classifier.
+    Pre-trained DeBERTa v3 prompt injection classifier (zero-shot on target data).
 
     Model: protectai/deberta-v3-base-prompt-injection-v2
     - Published by ProtectAI
@@ -261,6 +263,244 @@ class DeBERTaDetector:
                     raw_score=injection_score,
                     latency_ms=0  # filled below
                 ))
+        elapsed = (time.perf_counter() - start) * 1000
+        per_item = elapsed / len(texts) if texts else 0
+        for r in results:
+            r.latency_ms = per_item
+        return results
+
+
+class FineTunedDeBERTaDetector:
+    """
+    DeBERTa v3 fine-tuned on the target dataset's training split.
+
+    Starts from protectai/deberta-v3-base-prompt-injection-v2 and adapts
+    to the target distribution. Freezes embedding layer and first N of 12
+    encoder layers, training only the remaining layers + classifier head.
+
+    This closes the distribution gap observed when applying the pre-trained
+    model to datasets with different injection taxonomies.
+    """
+
+    def __init__(self, model_name: str = "protectai/deberta-v3-base-prompt-injection-v2",
+                 max_length: int = 256, epochs: int = 3, batch_size: int = 8,
+                 lr: float = 2e-5, freeze_n_layers: int = 9):
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.max_length = max_length
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.model_name = model_name
+        self._fitted = False
+
+        # Determine label mapping from model config
+        id2label = self.model.config.id2label
+        self._injection_id = 1
+        self._safe_id = 0
+        for lid, lname in id2label.items():
+            if str(lname).upper() == 'INJECTION':
+                self._injection_id = int(lid)
+            elif str(lname).upper() == 'SAFE':
+                self._safe_id = int(lid)
+
+        # Freeze embedding layer + first N encoder layers
+        if freeze_n_layers > 0:
+            for param in self.model.deberta.embeddings.parameters():
+                param.requires_grad = False
+            num_layers = len(self.model.deberta.encoder.layer)
+            freeze_up_to = min(freeze_n_layers, num_layers)
+            for i in range(freeze_up_to):
+                for param in self.model.deberta.encoder.layer[i].parameters():
+                    param.requires_grad = False
+
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        print("    Trainable: {:,} / {:,} params ({:.1f}%)".format(
+            trainable, total, 100.0 * trainable / total))
+
+    def fit(self, texts: List[str], labels: List[int]):
+        """Fine-tune the model on target training data."""
+        import torch
+        import random
+
+        # Map our labels (0=safe,1=injection) to model label convention
+        if self._injection_id == 1:
+            mapped_labels = list(labels)
+        else:
+            mapped_labels = [1 - l for l in labels]
+
+        self.model.train()
+        optimizer = torch.optim.AdamW(
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=self.lr, weight_decay=0.01
+        )
+
+        n = len(texts)
+        indices = list(range(n))
+
+        for epoch in range(self.epochs):
+            random.shuffle(indices)
+            total_loss = 0.0
+            num_batches = 0
+
+            for i in range(0, n, self.batch_size):
+                batch_idx = indices[i:i + self.batch_size]
+                batch_texts = [texts[j] for j in batch_idx]
+                batch_labels = torch.tensor(
+                    [mapped_labels[j] for j in batch_idx], dtype=torch.long
+                )
+
+                encodings = self.tokenizer(
+                    batch_texts, truncation=True, padding=True,
+                    max_length=self.max_length, return_tensors='pt'
+                )
+
+                optimizer.zero_grad()
+                outputs = self.model(
+                    input_ids=encodings['input_ids'],
+                    attention_mask=encodings['attention_mask'],
+                    labels=batch_labels
+                )
+                loss = outputs.loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            avg_loss = total_loss / num_batches
+            print("      Epoch {}/{}, Loss: {:.4f}".format(
+                epoch + 1, self.epochs, avg_loss))
+
+        self.model.eval()
+        self._fitted = True
+
+    def detect(self, text: str) -> DetectionResult:
+        import torch
+
+        if not self._fitted:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        start = time.perf_counter()
+        encodings = self.tokenizer(
+            text, truncation=True, padding=True,
+            max_length=self.max_length, return_tensors='pt'
+        )
+        with torch.no_grad():
+            outputs = self.model(**encodings)
+            probs = torch.softmax(outputs.logits, dim=-1)[0]
+
+        injection_score = float(probs[self._injection_id])
+        predicted = 1 if injection_score >= 0.5 else 0
+        elapsed = (time.perf_counter() - start) * 1000
+
+        return DetectionResult(
+            predicted_label=predicted,
+            confidence=float(max(probs)),
+            raw_score=injection_score,
+            latency_ms=elapsed
+        )
+
+    def detect_batch(self, texts: List[str]) -> List[DetectionResult]:
+        import torch
+
+        if not self._fitted:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        results = []
+        start = time.perf_counter()
+
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
+            encodings = self.tokenizer(
+                batch, truncation=True, padding=True,
+                max_length=self.max_length, return_tensors='pt'
+            )
+            with torch.no_grad():
+                outputs = self.model(**encodings)
+                probs = torch.softmax(outputs.logits, dim=-1)
+
+            for p in probs:
+                injection_score = float(p[self._injection_id])
+                predicted = 1 if injection_score >= 0.5 else 0
+                results.append(DetectionResult(
+                    predicted_label=predicted,
+                    confidence=float(max(p)),
+                    raw_score=injection_score,
+                    latency_ms=0
+                ))
+
+        elapsed = (time.perf_counter() - start) * 1000
+        per_item = elapsed / len(texts) if texts else 0
+        for r in results:
+            r.latency_ms = per_item
+        return results
+
+
+class EnsembleDetector:
+    """
+    Weighted ensemble of TF-IDF and DeBERTa detectors.
+
+    Covers complementary failure modes:
+    - TF-IDF: high precision on lexical patterns, fast inference
+    - DeBERTa: high AUROC on semantic patterns, contextual understanding
+
+    Combines raw injection scores via weighted average.
+    """
+
+    def __init__(self, tfidf_detector, deberta_detector,
+                 tfidf_weight: float = 0.4, deberta_weight: float = 0.6,
+                 threshold: float = 0.5):
+        self.tfidf = tfidf_detector
+        self.deberta = deberta_detector
+        self.tfidf_weight = tfidf_weight
+        self.deberta_weight = deberta_weight
+        self.threshold = threshold
+
+    def detect(self, text: str) -> DetectionResult:
+        start = time.perf_counter()
+        r_tfidf = self.tfidf.detect(text)
+        r_deberta = self.deberta.detect(text)
+
+        combined_score = (
+            self.tfidf_weight * r_tfidf.raw_score +
+            self.deberta_weight * r_deberta.raw_score
+        )
+        predicted = 1 if combined_score >= self.threshold else 0
+        elapsed = (time.perf_counter() - start) * 1000
+
+        return DetectionResult(
+            predicted_label=predicted,
+            confidence=combined_score if predicted == 1 else (1.0 - combined_score),
+            raw_score=combined_score,
+            latency_ms=elapsed
+        )
+
+    def detect_batch(self, texts: List[str]) -> List[DetectionResult]:
+        results = []
+        start = time.perf_counter()
+
+        tfidf_results = self.tfidf.detect_batch(texts)
+        deberta_results = self.deberta.detect_batch(texts)
+
+        for r_t, r_d in zip(tfidf_results, deberta_results):
+            combined_score = (
+                self.tfidf_weight * r_t.raw_score +
+                self.deberta_weight * r_d.raw_score
+            )
+            predicted = 1 if combined_score >= self.threshold else 0
+            results.append(DetectionResult(
+                predicted_label=predicted,
+                confidence=combined_score if predicted == 1 else (1.0 - combined_score),
+                raw_score=combined_score,
+                latency_ms=r_t.latency_ms + r_d.latency_ms
+            ))
+
         elapsed = (time.perf_counter() - start) * 1000
         per_item = elapsed / len(texts) if texts else 0
         for r in results:
