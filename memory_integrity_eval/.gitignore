@@ -1,0 +1,16 @@
+# Evaluation outputs
+results/*.json
+results/*.txt
+!results/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Temporary files
+/tmp/
+*.tmp
