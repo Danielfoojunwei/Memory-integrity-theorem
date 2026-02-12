@@ -320,7 +320,7 @@ class RealEvaluationRunner:
             deberta_pretrained=deberta_pretrained,
             tfidf_features=20000,
             ft_epochs=3,
-            ft_freeze_layers=6,
+            ft_freeze_layers=9,
         )
         all_results["detection_benchmarks"]["combined_corpus"] = comb_results
 
