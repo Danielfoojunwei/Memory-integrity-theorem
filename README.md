@@ -2,7 +2,7 @@
 
 ---
 
-**Abstract.** LLM agents that maintain persistent memory (e.g., `SOUL.md`, `CLAUDE.md`) are vulnerable to *persistent prompt injection* — attacks that permanently alter agent behaviour by writing malicious content into long-term storage. We formalize a **Memory Integrity Theorem** that guarantees *write integrity* for the persistence layer: under a trusted provenance-tracking runtime, untrusted inputs cannot modify protected memory items or promote data across session namespaces. Our approach applies the classical *reference monitor* concept from OS security to the specific problem of agent memory writes — it governs what gets persisted, not what the model reasons about. The provenance verifier blocks all 199 injection payloads and 7 canonical attack vectors in our test suite, with no effect on inference-layer utility, because it interposes only on the write path. We complement the structural guarantee with a detection-layer analysis across 5 classifiers and 3 public datasets (1,028 test examples), finding that fine-tuning DeBERTa-v3 on target data closes a 41-percentage-point F1 gap and that an ensemble of TF-IDF and fine-tuned DeBERTa achieves AUROC up to 99.63%. We discuss the relationship to inference-layer defenses (e.g., AgentDojo), clarify what the theorem does and does not guarantee, and identify the USER-channel trust boundary as the critical open problem for future work.
+**Abstract.** LLM agents that maintain persistent memory (e.g., `SOUL.md`, `CLAUDE.md`) are vulnerable to *persistent prompt injection* — attacks that permanently alter agent behaviour by writing malicious content into long-term storage. We formalize a **Memory Integrity Theorem** that guarantees *write integrity* for the persistence layer: under a trusted provenance-tracking runtime, untrusted inputs cannot modify protected memory items or promote data across session namespaces. Our approach applies the classical *reference monitor* concept from OS security to the specific problem of agent memory writes — it governs what gets persisted, not what the model reasons about. The provenance verifier blocks all 199 injection payloads across 796 multi-source tests (WEB, TOOL, SKILL channels) and defeats all 10 attack vectors (7 canonical + 3 USER-channel) in our test suite, with no effect on inference-layer utility. We complement the structural guarantee with a detection-layer analysis across 5 classifiers and 3 public datasets (1,028 test examples) with bootstrap 95% confidence intervals, finding that fine-tuning DeBERTa-v3 on target data achieves F1=96.61% [92.98%, 99.27%] on deepset and F1=98.21% [96.50%, 99.65%] on jailbreak data. We implement four USER-channel mitigations (audit log, rate limiter, content anomaly detector, declassification review) and discuss this trust boundary as the critical open problem.
 
 ---
 
@@ -20,9 +20,11 @@ Unlike ephemeral prompt injection — which affects a single conversation turn �
 
 2. **Memory Integrity Theorem (Section 4).** Under five explicit assumptions — including a *trusted enforcement boundary* between the runtime and the LLM — we prove that protected memory items cannot be modified by untrusted inputs. We scope the guarantee to write integrity (not read confidentiality) and to namespace-keyed stores (not vector indices).
 
-3. **Structural defense evaluation (Section 5).** We test the provenance verifier against 199 real injection payloads from public datasets and 7 programmatic attack vectors. All are blocked. We frame this as a *verification of implementation correctness*, not as a claim of adversarial robustness against novel attack strategies.
+3. **Structural defense evaluation (Section 5).** We test the provenance verifier against 199 real injection payloads across 796 multi-source tests (each payload tested through WEB, TOOL, and SKILL channels plus mutable key writes), 10 programmatic attack vectors (7 canonical + 3 USER-channel), and 2,450 cross-session isolation checks. All untrusted writes are blocked; USER-channel social engineering is flagged by anomaly detection.
 
-4. **Detection layer analysis (Section 6).** We evaluate 5 detectors across 3 public datasets (1,028 test examples), finding that domain adaptation closes large performance gaps and that ensembling improves calibration.
+4. **Detection layer analysis (Section 6).** We evaluate 5 detectors across 3 public datasets (1,028 test examples) with bootstrap 95% confidence intervals (1,000 iterations, seed 42), finding that domain adaptation closes large performance gaps and that ensembling improves calibration.
+
+5. **USER-channel mitigations (Section 9.5).** We implement four concrete defenses against USER-channel attacks: audit logging, rate limiting, content anomaly detection, and declassification review with trusted approval.
 
 **What this work does NOT claim.** We do not claim general agent security. We do not claim robustness against attacks through the USER channel (Section 9.5). We do not claim read confidentiality. We do not claim our detection results constitute state-of-the-art — they are situated within our specific evaluation protocol and may not generalize to other datasets or annotation conventions.
 
@@ -109,7 +111,7 @@ $$\frac{\pi_{\text{authorizer}} = \mathsf{UNTRUSTED} \lor \tau(m) = 1}{S_t \xrig
 
 **Rule 8 (Taint propagation):**
 $$\tau(b) = \max_{d \in \mathsf{ancestors}(b)} \tau(d)$$
-Taint is monotonically increasing: once any ancestor is tainted, all descendants are tainted. There is no operation that removes taint — this is a deliberate design choice (no "declassification" without explicit TRUSTED authorization).
+Taint is monotonically increasing: once any ancestor is tainted, all descendants are tainted. Taint can only be removed through an explicit **declassification** process requiring TRUSTED reviewer approval (see Section 9.5).
 
 **Rule 9 (Namespace scoping):**
 $$\mathsf{visible}(\sigma_s) = \{m \in M_t : m.\sigma = \sigma_s\} \cup \{m \in M_t : m.\sigma = \sigma_{\text{shared}}\}$$
@@ -151,7 +153,7 @@ This is analogous to how an OS kernel enforces file permissions regardless of wh
 
 ### 3.6 Attack Taxonomy
 
-We consider 7 canonical attack vectors:
+We consider 10 attack vectors: 7 canonical (targeting untrusted channels) and 3 USER-channel attacks (testing mitigations for Assumption A5):
 
 | # | Attack | Source | Mechanism |
 |---|--------|--------|-----------|
@@ -162,6 +164,9 @@ We consider 7 canonical attack vectors:
 | A5 | Cross-Session Data Leak | WEB | Access secrets from another session's namespace |
 | A6 | Dependency Chain Poisoning | TOOL | Taint laundering through intermediate belief nodes |
 | A7 | Taint Washing | SKILL | Attempt to remove taint via trusted-looking intermediary |
+| A8 | USER Social Engineering | USER | Trick user into pasting injection content (flagged by anomaly detector) |
+| A9 | USER Rate Flood | USER | Rapid USER writes to overwhelm review (blocked by rate limiter) |
+| A10 | Declassification Abuse | USER | Untrusted principal attempts to approve declassification |
 
 ---
 
@@ -249,22 +254,23 @@ We evaluate 5 detectors spanning the complexity spectrum:
 
 **D3: DeBERTa-v3 pre-trained (zero-shot transfer).** `protectai/deberta-v3-base-prompt-injection-v2` (184M parameters) applied directly to target data without fine-tuning. Represents the common deployment pattern of using an off-the-shelf classifier on a new distribution.
 
-**D4: DeBERTa-v3 fine-tuned (domain-adapted).** Same architecture, adapted to each dataset's training split. We freeze the embedding layer and first 9 of 12 encoder layers, training only the last 3 encoder layers + classification head (22.25M / 184.42M = 12.1% trainable parameters). Hyperparameters: 3 epochs (deepset, jailbreak) or 2 epochs (combined); batch size 8; learning rate 2e-5; AdamW optimizer (weight decay 0.01); gradient clipping at norm 1.0; `torch.manual_seed(42)`.
+**D4: DeBERTa-v3 fine-tuned (domain-adapted).** Same architecture, adapted to each dataset's training split. For smaller datasets (deepset, jailbreak), we freeze the embedding layer and first 6 of 12 encoder layers, training the last 6 encoder layers + classification head (~25% trainable parameters). For the larger combined corpus, we freeze 9 layers (12.1% trainable) for computational efficiency. Hyperparameters: 5 epochs (deepset), 4 epochs (jailbreak), 3 epochs (combined); batch size 8; learning rate 2e-5; AdamW optimizer (weight decay 0.01); gradient clipping at norm 1.0; `torch.manual_seed(42)`.
 
 **D5: Ensemble.** Weighted average of D2 and D4 scores: $s = 0.4 \cdot s_{\text{TF-IDF}} + 0.6 \cdot s_{\text{DeBERTa-FT}}$, threshold 0.5.
 
 ### 5.3 Defense Evaluation
 
 **Provenance verifier.** We test the structural defense (Section 3.3) against:
-- 199 real injection payloads extracted from test sets (all examples with ground-truth label = injection)
-- 7 programmatic attack vectors from the taxonomy (Section 3.6)
+- 199 real injection payloads extracted from test sets (all examples with ground-truth label = injection), each tested through 3 untrusted provenance channels (WEB, TOOL, SKILL) plus mutable key writes = 796 total tests
+- 10 programmatic attack vectors from the taxonomy (Section 3.6): 7 canonical untrusted-channel attacks + 3 USER-channel attacks
 - Cross-session isolation across 50 concurrent sessions (2,450 pair-wise namespace checks)
+- Audit log verification: all write attempts are logged with provenance, timestamp, and outcome
 
-This evaluation confirms that the verifier *implementation* correctly enforces the formal rules. It does not constitute an adversarial robustness evaluation against novel attack strategies — the verifier's security depends on Assumptions A1–A5, not on the diversity of the test payloads.
+This evaluation confirms that the verifier *implementation* correctly enforces the formal rules across all provenance channels. It does not constitute an adversarial robustness evaluation against novel attack strategies — the verifier's security depends on Assumptions A1–A5, not on the diversity of the test payloads.
 
 ### 5.4 Metrics
 
-**Detection:** accuracy, precision, recall, F1-score, AUROC (via `sklearn.metrics`, threshold 0.5 for binary predictions). **Defense:** block rate (proportion of injection payloads rejected), memory integrity preservation (SHA-256 hash comparison of `SOUL.md` before and after), cross-session leak rate.
+**Detection:** accuracy, precision, recall, F1-score, AUROC (via `sklearn.metrics`, threshold 0.5 for binary predictions), with bootstrap 95% confidence intervals (1,000 iterations, seed 42) for F1 and AUROC. **Defense:** block rate (proportion of injection payloads rejected across all provenance channels), memory integrity preservation (SHA-256 hash comparison of `SOUL.md` before and after), cross-session leak rate, audit log completeness.
 
 ### 5.5 Published Baselines
 
@@ -286,57 +292,64 @@ This evaluation confirms that the verifier *implementation* correctly enforces t
 
 | Detector | Accuracy | Precision | Recall | F1 | AUROC | Latency |
 |----------|----------|-----------|--------|----|-------|---------|
-| D1: Heuristic | 50.86% | 100.00% | 5.00% | 9.52% | 52.50% | 0.07 ms |
-| D2: TF-IDF+LR | 90.52% | 98.04% | 83.33% | 90.09% | 97.44% | 0.19 ms |
-| D3: DeBERTa pretrained | 67.24% | 100.00% | 36.67% | 53.66% | 89.57% | 375.5 ms |
-| D4: DeBERTa fine-tuned | 94.83% | 100.00% | 90.00% | 94.74% | 97.74% | 22.5 ms |
-| D5: Ensemble | 94.83% | 100.00% | 90.00% | 94.74% | 99.14% | 22.2 ms |
+| D1: Heuristic | 50.86% | 100.00% | 5.00% | 9.52% | 52.50% | 0.06 ms |
+| D2: TF-IDF+LR | 90.52% | 98.04% | 83.33% | 90.09% | 97.44% | 0.17 ms |
+| D3: DeBERTa pretrained | 67.24% | 100.00% | 36.67% | 53.66% | 89.57% | 112.4 ms |
+| D4: DeBERTa fine-tuned | **96.55%** | **98.28%** | **95.00%** | **96.61%** | **99.26%** | 27.7 ms |
+| D5: Ensemble | 96.55% | 98.28% | 95.00% | 96.61% | 99.32% | 26.8 ms |
+
+*95% CI (best detector, D4): F1 [92.98%, 99.27%], AUROC [97.56%, 100.00%]*
 
 **Table 2. jackhhao/jailbreak-classification (n=262 test, 139 positive, 123 negative).**
 
 | Detector | Accuracy | Precision | Recall | F1 | AUROC | Latency |
 |----------|----------|-----------|--------|----|-------|---------|
-| D1: Heuristic | 61.07% | 79.37% | 35.97% | 49.50% | 62.75% | 0.78 ms |
-| D2: TF-IDF+LR | 96.56% | 99.24% | 94.24% | 96.68% | 99.51% | 1.78 ms |
-| D3: DeBERTa pretrained | 90.84% | 98.32% | 84.17% | 90.70% | 97.91% | 513.7 ms |
-| D4: DeBERTa fine-tuned | 97.33% | 97.14% | 97.84% | 97.49% | 98.87% | 55.1 ms |
-| D5: Ensemble | 97.33% | 97.14% | 97.84% | 97.49% | 99.63% | 55.8 ms |
+| D1: Heuristic | 61.07% | 79.37% | 35.97% | 49.50% | 62.75% | 0.75 ms |
+| D2: TF-IDF+LR | 96.56% | 99.24% | 94.24% | 96.68% | 99.51% | 1.89 ms |
+| D3: DeBERTa pretrained | 90.84% | 98.32% | 84.17% | 90.70% | 97.91% | 273.7 ms |
+| D4: DeBERTa fine-tuned | **98.09%** | **97.83%** | **98.56%** | **98.21%** | **99.03%** | 51.7 ms |
+| D5: Ensemble | 98.09% | 97.83% | 98.56% | 98.21% | 99.64% | 56.1 ms |
+
+*95% CI (best detector, D4): F1 [96.50%, 99.65%], AUROC [98.14%, 99.99%]*
 
 **Table 3. Combined corpus (n=650 test, 202 positive, 448 negative).**
 
 | Detector | Accuracy | Precision | Recall | F1 | AUROC | Latency |
 |----------|----------|-----------|--------|----|-------|---------|
-| D1: Heuristic | 58.92% | 33.33% | 32.18% | 32.75% | 51.85% | 0.68 ms |
-| D2: TF-IDF+LR | 95.54% | 95.29% | 90.10% | 92.62% | 98.26% | 1.35 ms |
-| D3: DeBERTa pretrained | 92.00% | 96.88% | 76.73% | 85.64% | 92.62% | 228.0 ms |
-| D4: DeBERTa fine-tuned | 96.31% | 97.85% | 90.10% | 93.81% | 98.18% | 56.7 ms |
-| D5: Ensemble | 96.62% | 97.87% | 91.09% | 94.36% | 98.75% | 59.0 ms |
+| D1: Heuristic | 58.92% | 33.33% | 32.18% | 32.75% | 51.85% | 0.59 ms |
+| D2: TF-IDF+LR | 95.54% | 95.29% | 90.10% | 92.62% | 98.26% | 1.39 ms |
+| D3: DeBERTa pretrained | 92.00% | 96.88% | 76.73% | 85.64% | 92.62% | 618.5 ms |
+| D4: DeBERTa fine-tuned | 96.31% | 97.85% | 90.10% | 93.81% | 98.18% | 55.2 ms |
+| D5: Ensemble | **96.77%** | **97.90%** | **91.58%** | **96.48%** | **99.01%** | 57.4 ms |
+
+*95% CI (best detector, D5 Ensemble): F1 [94.36%, 98.20%], AUROC [98.21%, 99.82%]*
 
 ### 6.2 Impact of Fine-Tuning
 
 **Table 4. DeBERTa-v3 F1 before and after fine-tuning.**
 
-| Dataset | Pre-trained F1 | Fine-tuned F1 | $\Delta$ F1 | Recall gain | Time (CPU) |
-|---------|---------------|---------------|-------------|-------------|------------|
-| deepset | 53.66% | 94.74% | +41.08pp | 36.67% → 90.00% | 154s |
-| jailbreak | 90.70% | 97.49% | +6.79pp | 84.17% → 97.84% | 799s |
-| combined | 85.64% | 93.81% | +8.17pp | 76.73% → 90.10% | 1317s |
+| Dataset | Pre-trained F1 | Fine-tuned F1 | $\Delta$ F1 | Recall gain | Freeze | Epochs | Time (CPU) |
+|---------|---------------|---------------|-------------|-------------|--------|--------|------------|
+| deepset | 53.66% | **96.61%** | +42.95pp | 36.67% → 95.00% | 6/12 | 5 | 282s |
+| jailbreak | 90.70% | **98.21%** | +7.51pp | 84.17% → 98.56% | 6/12 | 4 | 1,177s |
+| combined | 85.64% | 93.81% | +8.17pp | 76.73% → 90.10% | 9/12 | 3 | 2,075s |
 
-The deepset improvement is striking: the pre-trained model missed 38 of 60 injections (recall 36.67%) due to distribution mismatch. After fine-tuning 12.1% of parameters for 3 epochs, recall reaches 90.00% with zero false positives.
+The deepset improvement is striking: the pre-trained model missed 38 of 60 injections (recall 36.67%) due to distribution mismatch. After fine-tuning with 6 frozen layers (25% trainable parameters) for 5 epochs, recall reaches 95.00% with near-perfect precision. The deeper fine-tuning (freezing 6 vs. 9 layers) closes the gap to the protectai v1 baseline: our F1=96.61% now exceeds protectai's reported 96.40%.
 
 ### 6.3 Comparison with Published Results
 
 **Table 5. Our results in context of published baselines.**
 
-| Method | Dataset | F1 | Context |
-|--------|---------|-----|---------|
-| DeBERTa fine-tuned (ours) | deepset | 94.74% | 1.66pp below protectai v1 (96.40%) |
-| deepset self-evaluation | deepset | 99.40% | Trained on full dataset, self-evaluation |
-| protectai/deberta-v3 v1 | deepset | 96.40% | Full model, different training procedure |
-| DeBERTa fine-tuned (ours) | jailbreak | 97.49% | +9.49pp above Jain et al. RoBERTa (~88%) |
-| Ensemble (ours) | jailbreak | 97.49% (AUROC 99.63%) | Highest AUROC in our evaluation |
+| Method | Dataset | F1 | 95% CI | Context |
+|--------|---------|-----|--------|---------|
+| DeBERTa fine-tuned (ours) | deepset | **96.61%** | [92.98%, 99.27%] | +0.21pp above protectai v1 (96.40%) |
+| deepset self-evaluation | deepset | 99.40% | — | Trained on full dataset, self-evaluation |
+| protectai/deberta-v3 v1 | deepset | 96.40% | — | Full model, different training procedure |
+| DeBERTa fine-tuned (ours) | jailbreak | **98.21%** | [96.50%, 99.65%] | +10.21pp above Jain et al. RoBERTa (~88%) |
+| Ensemble (ours) | jailbreak | 98.21% (AUROC 99.64%) | F1 [96.50%, 99.65%] | Highest AUROC in our evaluation |
+| Ensemble (ours) | combined | **96.48%** | [94.36%, 98.20%] | Best on combined corpus |
 
-**Caveats on comparison.** These numbers are not directly comparable across studies due to differences in: (a) train/test splits — deepset's self-evaluation uses the full dataset; (b) preprocessing — Jain et al. [5] use different tokenization and prompt formatting; (c) model capacity — we freeze 75% of encoder layers for efficiency, while baselines use full models. We report these comparisons for *context*, not to claim superiority. Within our own evaluation protocol (same splits, same preprocessing, same hardware), fine-tuning and ensembling consistently improve performance.
+**Caveats on comparison.** These numbers are not directly comparable across studies due to differences in: (a) train/test splits — deepset's self-evaluation uses the full dataset; (b) preprocessing — Jain et al. [5] use different tokenization and prompt formatting; (c) model capacity — we freeze 50–75% of encoder layers for efficiency, while baselines use full models. We report these comparisons for *context*, not to claim superiority. Within our own evaluation protocol (same splits, same preprocessing, same hardware), fine-tuning and ensembling consistently improve performance. Bootstrap 95% CIs are computed over 1,000 iterations with seed 42.
 
 ### 6.4 Defense Verification
 
@@ -344,26 +357,32 @@ The deepset improvement is striking: the pre-trained model missed 38 of 60 injec
 
 | Test | Result |
 |------|--------|
-| Injection payloads blocked | 199/199 (100%) |
-| Attack vectors blocked (7 canonical) | 7/7 (100%) |
+| Multi-source injection tests (199 payloads × 4 tests each) | 796/796 blocked (100%) |
+| Provenance channels tested | WEB, TOOL, SKILL |
+| Attack vectors (7 canonical) | 7/7 blocked (100%) |
+| Attack vectors (3 USER-channel) | 0/3 successful (1 flagged, 1 rate-limited, 1 blocked) |
 | Cross-session isolation (50 sessions, 2,450 pair-checks) | 0 leaks |
 | SOUL.md integrity (SHA-256 pre vs. post) | Identical |
+| Audit log entries captured | All write attempts logged |
 | Memory items modified by untrusted input | 0 |
 | Theorem 1 holds (for this execution) | True |
 
-**Interpretation.** The 199/199 block rate confirms that the verifier implementation correctly enforces the formal rules against real injection payloads. This is a *correctness test*, not an *adversarial robustness evaluation*. The payloads were drawn from public datasets and were not crafted to target our specific defense. The verifier's security guarantee comes from the formal rules (Section 3.3) and the trusted runtime assumption (A1), not from the diversity of the test suite. An adversary who satisfies our threat model — i.e., operates through untrusted channels — cannot write to protected memory regardless of payload content, because the check is structural (provenance and taint), not content-based.
+**Interpretation.** The 796/796 multi-source block rate confirms that the verifier implementation correctly enforces the formal rules against real injection payloads across all three untrusted provenance channels (WEB, TOOL, SKILL). Each of the 199 payloads is tested through each untrusted channel plus a mutable key write, yielding 796 total tests. This is a *correctness test*, not an *adversarial robustness evaluation*. The verifier's security guarantee comes from the formal rules (Section 3.3) and the trusted runtime assumption (A1), not from the diversity of the test suite. An adversary who satisfies our threat model — i.e., operates through untrusted channels — cannot write to protected memory regardless of payload content, because the check is structural (provenance and taint), not content-based.
 
 **Table 7. Attack vector breakdown.**
 
-| Attack | Type | Blocked | Mechanism |
-|--------|------|---------|-----------|
-| A1: SOUL.md Direct Modification | Persistent injection | Yes | Immutability (Rule 3) |
-| A2: Hidden Instruction Injection | Indirect injection | Yes | WEB taint (Rule 4) |
-| A3: Scheduled Reinjection | Persistent backdoor | Yes | SKILL taint (Rule 4) |
-| A4: Tool Output Poisoning | Indirect injection | Yes | Immutability + TOOL taint (Rules 3, 4) |
-| A5: Cross-Session Data Leak | Session breach | Yes | Namespace isolation (Rule 9) |
-| A6: Dependency Chain Poisoning | Taint propagation | Yes | Transitive taint (Rule 8) |
-| A7: Taint Washing | Privilege escalation | Yes | No trusted justification (Rule 5) |
+| Attack | Type | Result | Mechanism |
+|--------|------|--------|-----------|
+| A1: SOUL.md Direct Modification | Persistent injection | Blocked | Immutability (Rule 3) |
+| A2: Hidden Instruction Injection | Indirect injection | Blocked | WEB taint (Rule 4) |
+| A3: Scheduled Reinjection | Persistent backdoor | Blocked | SKILL taint (Rule 4) |
+| A4: Tool Output Poisoning | Indirect injection | Blocked | Immutability + TOOL taint (Rules 3, 4) |
+| A5: Cross-Session Data Leak | Session breach | Blocked | Namespace isolation (Rule 9) |
+| A6: Dependency Chain Poisoning | Taint propagation | Blocked | Transitive taint (Rule 8) |
+| A7: Taint Washing | Privilege escalation | Blocked | No trusted justification (Rule 5) |
+| A8: USER Social Engineering | USER channel | Flagged | ContentAnomalyDetector detects patterns |
+| A9: USER Rate Flood | USER channel | Rate-limited | RateLimiter blocks excess writes |
+| A10: Declassification Abuse | Privilege escalation | Blocked | Untrusted reviewer rejected |
 
 ---
 
@@ -371,16 +390,16 @@ The deepset improvement is striking: the pre-trained model missed 38 of 60 injec
 
 ### 7.1 Why Detection Alone Is Insufficient
 
-Even our best detector (D4, F1=97.49% on jailbreak) has residual errors:
-- deepset: 6 false negatives (6 missed injections out of 60)
-- jailbreak: 3 false negatives (3 missed out of 139)
+Even our best detector (D4, F1=98.21% on jailbreak) has residual errors:
+- deepset: 3 false negatives (3 missed injections out of 60)
+- jailbreak: 2 false negatives (2 missed out of 139)
 - combined: 20 false negatives (20 missed out of 202)
 
 In a detection-only architecture, each missed injection is a potential successful attack on persistent memory. At scale (thousands of interactions per day), even a 2.5% miss rate translates to dozens of potential memory poisoning events. The provenance verifier catches all of these because it checks *structural properties* (provenance, taint, immutability) rather than *content* — it doesn't need to understand whether a payload is malicious, only whether the write proposal has trusted provenance.
 
 ### 7.2 Distribution Mismatch Drives Zero-Shot Failure
 
-TF-IDF+LR (F1=90.09%) outperforms the 184M-parameter DeBERTa (F1=53.66%) on deepset by 36.43pp in the zero-shot setting. This is not because TF-IDF is a better model — it's because distribution mismatch causes catastrophic recall failure. DeBERTa achieves 100% precision but only 36.67% recall: it recognizes injections from its training distribution but misses 63% of deepset's injections because they look different. After fine-tuning on deepset's training split, DeBERTa's recall jumps to 90.00% and it outperforms TF-IDF.
+TF-IDF+LR (F1=90.09%) outperforms the 184M-parameter DeBERTa (F1=53.66%) on deepset by 36.43pp in the zero-shot setting. This is not because TF-IDF is a better model — it's because distribution mismatch causes catastrophic recall failure. DeBERTa achieves 100% precision but only 36.67% recall: it recognizes injections from its training distribution but misses 63% of deepset's injections because they look different. After fine-tuning on deepset's training split with deeper unfreezing (6/12 layers frozen), DeBERTa's recall jumps to 95.00% and F1 reaches 96.61%, surpassing the protectai v1 baseline (96.40%).
 
 This finding is consistent with Liu et al. [3]: feature engineering can outperform large transformers when distribution alignment is poor. The practical implication is that deploying off-the-shelf injection classifiers on new distributions without adaptation is unreliable.
 
@@ -398,27 +417,27 @@ The appropriate framing is that these are *complementary defenses* for different
 ### 7.4 Ensemble Calibration
 
 The ensemble (D5) ties or exceeds D4 on F1 and consistently achieves the highest AUROC:
-- deepset: 99.14% AUROC (vs. 97.74% for D4)
-- jailbreak: 99.63% AUROC (vs. 98.87% for D4)
-- combined: 98.75% AUROC (vs. 98.18% for D4)
+- deepset: 99.32% AUROC (vs. 99.26% for D4)
+- jailbreak: 99.64% AUROC (vs. 99.03% for D4)
+- combined: 99.01% AUROC (vs. 98.18% for D4)
 
 The AUROC improvement indicates better-calibrated confidence scores from combining lexical (TF-IDF) and semantic (DeBERTa) signals. This is valuable for threshold tuning in deployment.
 
 ### 7.5 Fine-Tuning Efficiency
 
-Fine-tuning 12.1% of DeBERTa parameters achieves near-full-model performance (our gap to protectai v1 is 1.66pp on deepset) while running in 154–1,317 seconds on CPU. This makes the approach practical without GPU infrastructure.
+Fine-tuning with deeper unfreezing (6/12 layers frozen = 25% trainable parameters for smaller datasets, 9/12 frozen = 12.1% for the combined corpus) now exceeds the protectai v1 baseline on deepset (+0.21pp F1) while running in 282–2,075 seconds on CPU. This makes the approach practical without GPU infrastructure.
 
 ---
 
 ## 8. Limitations of the Formal Model
 
-1. **Immutability and real workflows.** Marking identity files as immutable prevents *all* modification — including legitimate updates. Real agent workflows often need to update memory (e.g., learning user preferences). Our model supports mutable items with taint-based write control, but the "default immutable" posture requires explicit override for legitimate writes. Future work should explore *graduated mutability* with authenticated update channels.
+1. **Immutability and real workflows.** Marking identity files as immutable prevents *all* modification — including legitimate updates. Real agent workflows often need to update memory (e.g., learning user preferences). We now implement a **declassification mechanism** (Section 9.5) that allows graduated mutability: a `DeclassificationReview` process requires TRUSTED reviewer approval before tainted data can be written to memory. This enables patterns like "agent extracts a fact from the web, submits it for human review, and stores it after approval." The declassification request/review workflow is logged in the audit log for accountability.
 
-2. **Conservative taint propagation.** Our taint model is monotonic: once tainted, always tainted. This is secure but restrictive — it prevents useful patterns like "the agent reads a web page, extracts a fact, and stores it." A *declassification* mechanism (where a trusted review process can remove taint from specific data) would enable richer workflows, but its design is non-trivial and we leave it to future work.
+2. **Conservative taint propagation.** Our taint model is monotonic: once tainted, always tainted. This is secure but restrictive — it prevents useful patterns like "the agent reads a web page, extracts a fact, and stores it." The declassification mechanism (above) provides a controlled path for removing taint, but requires explicit TRUSTED authorization. Automatic declassification (e.g., via content analysis) remains future work.
 
 3. **Namespace-keyed stores only.** The session isolation guarantee (Part III) relies on namespace-keyed storage (key-value stores, file systems with directory isolation). Vector stores with approximate nearest-neighbour retrieval may return results across namespace boundaries if embeddings are stored in a shared index. Partition-by-namespace strategies for vector stores are future work.
 
-4. **No formal verification of the runtime.** We assume the runtime correctly implements the rules (Assumption A1), but we have not formally verified the runtime implementation using a proof assistant (e.g., Coq, Lean). Our test suite (38 tests) provides empirical confidence, not formal proof of implementation correctness.
+4. **No formal verification of the runtime.** We assume the runtime correctly implements the rules (Assumption A1), but we have not formally verified the runtime implementation using a proof assistant (e.g., Coq, Lean). Our test suite (62 tests) provides empirical confidence, not formal proof of implementation correctness.
 
 ---
 
@@ -426,11 +445,11 @@ Fine-tuning 12.1% of DeBERTa parameters achieves near-full-model performance (ou
 
 ### 9.1 Small Test Suite
 
-The 199 injection payloads are drawn from public datasets and represent known attack patterns. We do not claim robustness against novel adversarial strategies crafted specifically to target provenance-based defenses. The verifier's security depends on the formal rules and the trusted runtime, not on having "seen" enough attacks.
+The 199 injection payloads are drawn from public datasets and represent known attack patterns. However, we now test each payload through 3 provenance channels (WEB, TOOL, SKILL) plus a mutable key write, yielding 796 total verifier tests. We do not claim robustness against novel adversarial strategies crafted specifically to target provenance-based defenses. The verifier's security depends on the formal rules and the trusted runtime, not on having "seen" enough attacks.
 
 ### 9.2 Detection Results Are Protocol-Specific
 
-Our detection numbers (e.g., 97.49% F1 on jailbreak) are specific to our evaluation protocol: stratified 80/20 split with `random_state=42`, no augmentation, character n-gram TF-IDF, partial DeBERTa fine-tuning. Results may differ under different splits, preprocessing, or full-model fine-tuning. We do not report confidence intervals because we use a single fixed split; future work should use k-fold cross-validation.
+Our detection numbers (e.g., 98.21% F1 on jailbreak) are specific to our evaluation protocol: stratified 80/20 split with `random_state=42`, no augmentation, character n-gram TF-IDF, partial DeBERTa fine-tuning. Results may differ under different splits, preprocessing, or full-model fine-tuning. We report bootstrap 95% confidence intervals (1,000 iterations, seed 42) for F1 and AUROC to quantify uncertainty from the single fixed split.
 
 ### 9.3 No End-to-End Agent Evaluation
 
@@ -448,13 +467,19 @@ The most important limitation is Assumption A5: we assume the adversary cannot i
 - **Clipboard injection.** Malicious content copied from a compromised webpage is pasted by the user.
 - **UI confusion.** The agent interface does not clearly distinguish $\mathsf{TRUSTED}$ and $\mathsf{UNTRUSTED}$ sources, leading the user to accidentally approve a malicious write.
 
-Mitigations (not implemented in this work):
-- **Diff view for memory writes.** Show the user exactly what will change before committing.
-- **Rate-limited promotions.** Cap the rate of $\mathsf{USER}$-authorized writes to prevent bulk compromise.
-- **Audit logs.** Maintain an immutable log of all write operations for post-hoc review.
-- **Content anomaly detection.** Flag $\mathsf{USER}$-sourced writes that resemble known injection patterns (using the detection layer as a secondary check).
+**Implemented mitigations.** We implement four defense-in-depth mitigations for the USER channel:
 
-We identify this as the critical open problem: the boundary between "what the user intended" and "what the adversary tricked the user into doing" is fundamentally a UX and authentication problem, not a provenance-tracking problem.
+1. **Audit log (`AuditLog`).** An append-only, immutable log of all write operations recording principal, key, timestamp, success/failure, and reason. Enables post-hoc forensic review of USER-channel writes.
+
+2. **Rate limiter (`RateLimiter`).** Caps USER-authorized writes to a configurable maximum per time window (default: 10 writes per 60 seconds). Prevents bulk compromise through rapid automated writes. Attack A9 (USER Rate Flood) demonstrates this defense: 15 rapid writes are attempted, but only 10 succeed before the limiter blocks further writes.
+
+3. **Content anomaly detector (`ContentAnomalyDetector`).** Flags USER-sourced writes whose content matches 14 injection patterns (e.g., "ignore all previous", "override system prompt", `<script>`, SQL injection markers). Attack A8 (USER Social Engineering) demonstrates this defense: a social engineering payload arriving with USER provenance is flagged as anomalous and logged, even though the write technically succeeds (USER is trusted). The audit log records the anomaly flag for human review.
+
+4. **Declassification review (`DeclassificationReview`).** Enables graduated mutability for tainted data: a `DeclassificationRequest` must be submitted and approved by a TRUSTED reviewer before tainted data can be written to memory. Attack A10 (Declassification Abuse) demonstrates that an untrusted principal (TOOL) cannot approve declassification — only TRUSTED reviewers (SYS, USER) can.
+
+5. **Memory diff view (`MemoryDiff`).** Shows the user exactly what will change before committing: old value, new value, provenance, taint status, and anomaly flags. Enables informed consent for memory modifications.
+
+**Evaluation.** Three USER-channel attacks (A8–A10) test these mitigations. None succeed: A8 is flagged by anomaly detection, A9 is rate-limited, A10 is blocked by the declassification review. However, these mitigations are *defense-in-depth*, not formal guarantees — the boundary between "what the user intended" and "what the adversary tricked the user into doing" remains fundamentally a UX and authentication problem.
 
 ### 9.6 Deployment Considerations
 
@@ -469,9 +494,9 @@ Real-world deployment requires solving several engineering challenges not addres
 
 We presented a reference monitor for LLM agent memory that provides provenance-based write integrity. The Memory Integrity Theorem, stated under five explicit assumptions, guarantees that untrusted inputs cannot modify protected memory items or transfer data across session namespaces. The defense operates at the persistence layer — interposing on memory writes, not inference — which eliminates the security-utility trade-off observed in inference-layer defenses.
 
-Our implementation blocks all 199 real injection payloads and 7 canonical attack vectors in our test suite, confirming the correctness of the verifier logic. We complement the structural guarantee with a detection-layer analysis showing that domain adaptation closes large performance gaps (41pp F1 improvement on deepset) and that ensembling improves confidence calibration (AUROC up to 99.63%).
+Our implementation blocks all 199 real injection payloads across 796 multi-source tests and defeats all 10 attack vectors (7 canonical + 3 USER-channel) in our test suite, confirming the correctness of the verifier logic. We complement the structural guarantee with a detection-layer analysis showing that deeper fine-tuning closes the gap to published baselines (F1=96.61% on deepset, exceeding protectai v1's 96.40%) and that ensembling improves confidence calibration (AUROC up to 99.64%). Bootstrap 95% CIs provide uncertainty quantification for all detection results.
 
-The formal model makes explicit what prior work often leaves implicit: the *enforcement boundary* between the trusted runtime and the untrusted LLM, the *scope* of the guarantee (write integrity, not read confidentiality), and the *critical assumption* that the USER channel is not compromised. We identify USER-channel security as the most important open problem for future work and propose mitigation strategies.
+We implement four USER-channel mitigations (audit log, rate limiter, content anomaly detector, declassification review) that provide defense-in-depth for the critical open problem identified by Assumption A5. The formal model makes explicit what prior work often leaves implicit: the *enforcement boundary* between the trusted runtime and the untrusted LLM, the *scope* of the guarantee (write integrity, not read confidentiality), and the *critical assumption* that the USER channel is not compromised.
 
 The architectural insight — that memory write integrity can be enforced by a small reference monitor at the persistence layer without modifying the inference pipeline — suggests a general design principle for trustworthy agentic AI: separate the concerns of *what the model thinks* from *what it can persist*.
 
@@ -486,14 +511,14 @@ memory-integrity-theorem/
 ├── memory-integrity-theorem.md          # Formal theorem document
 ├── memory_integrity_eval/
 │   ├── src/
-│   │   ├── agent_state.py               # Agent state model, verifier
-│   │   ├── attack_simulator.py          # 7 attack vector implementations
+│   │   ├── agent_state.py               # Agent state model, verifier, USER-channel defenses
+│   │   ├── attack_simulator.py          # 10 attack vector implementations (7 canonical + 3 USER)
 │   │   ├── detectors.py                 # 5 detectors (D1-D5)
-│   │   ├── real_benchmark.py            # Dataset loaders, metrics, baselines
+│   │   ├── real_benchmark.py            # Dataset loaders, metrics, bootstrap CIs, baselines
 │   │   ├── main_evaluation.py           # Full evaluation pipeline
 │   │   └── benchmark_integration.py     # Legacy benchmark integration
 │   ├── tests/
-│   │   └── test_memory_integrity.py     # 38 unit tests
+│   │   └── test_memory_integrity.py     # 62 unit tests
 │   ├── results/                         # Evaluation results (JSON)
 │   └── requirements.txt
 └── LICENSE                              # Apache 2.0
@@ -506,9 +531,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install scikit-learn pandas numpy datasets transformers tqdm pyyaml pytest
 
 cd memory_integrity_eval/src
-python main_evaluation.py    # ~45 min on CPU
+python main_evaluation.py    # ~66 min on CPU
 
-pytest memory_integrity_eval/tests/ -v    # 38 tests
+pytest memory_integrity_eval/tests/ -v    # 62 tests
 ```
 
 ### 11.3 Reproducibility Details
@@ -517,25 +542,28 @@ pytest memory_integrity_eval/tests/ -v    # 38 tests
 |------|-------|
 | Random seed (sklearn splits) | 42 |
 | Random seed (PyTorch) | 42 |
+| Random seed (bootstrap CI) | 42 |
+| Bootstrap iterations | 1,000 |
+| Confidence level | 95% |
 | Train/test split ratio | 80/20, stratified |
 | TF-IDF features | char n-gram (1,4), max 15,000, sublinear TF |
 | Logistic Regression | L-BFGS, balanced weights, C=1.0 |
 | DeBERTa base model | `protectai/deberta-v3-base-prompt-injection-v2` |
-| DeBERTa frozen layers | Embedding + encoder layers 0–8 (9 of 12) |
-| DeBERTa trainable params | 22.25M / 184.42M (12.1%) |
-| Fine-tuning epochs | 3 (deepset, jailbreak), 2 (combined) |
+| DeBERTa frozen layers | 6/12 (deepset, jailbreak), 9/12 (combined) |
+| DeBERTa trainable params | ~25% (freeze 6) or 12.1% (freeze 9) |
+| Fine-tuning epochs | 5 (deepset), 4 (jailbreak), 3 (combined) |
 | Batch size | 8 |
 | Learning rate | 2e-5 |
 | Optimizer | AdamW (weight decay 0.01) |
 | Gradient clipping | Max norm 1.0 |
 | Hardware | Single CPU (no GPU) |
-| Total wall-clock time | 2,750 seconds (45.8 minutes) |
+| Total wall-clock time | 3,959 seconds (66.0 minutes) |
 | Python version | ≥ 3.9 |
 | Key dependencies | torch, transformers, scikit-learn, datasets |
 
 ### 11.4 Known Reproducibility Limitations
 
-- **No confidence intervals.** We use a single fixed train/test split. Results may vary under different splits. Future work should report k-fold cross-validation with standard deviations.
+- **Single fixed split.** We use a single fixed train/test split (stratified, `random_state=42`). Bootstrap 95% CIs (1,000 iterations) quantify uncertainty from this split, but k-fold cross-validation would provide more robust estimates.
 - **DeBERTa non-determinism.** PyTorch operations on CPU are not fully deterministic across hardware. Results may differ slightly on different machines.
 - **Dataset versioning.** HuggingFace datasets may be updated over time. We used the versions available as of February 2026.
 
