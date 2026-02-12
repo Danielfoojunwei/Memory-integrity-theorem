@@ -45,6 +45,71 @@ class ClassificationMetrics:
     auroc: float = 0.0
     avg_latency_ms: float = 0.0
     total_examples: int = 0
+    f1_ci_lower: float = 0.0
+    f1_ci_upper: float = 0.0
+    auroc_ci_lower: float = 0.0
+    auroc_ci_upper: float = 0.0
+
+
+def bootstrap_ci(
+    y_true: List[int],
+    y_pred: List[int],
+    y_scores: List[float],
+    metric_fn,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> Tuple[float, float]:
+    """
+    Compute bootstrap confidence interval for a metric.
+
+    Args:
+        y_true: ground-truth labels
+        y_pred: predicted labels (used for F1, precision, recall)
+        y_scores: raw scores (used for AUROC)
+        metric_fn: callable(y_true, y_pred_or_scores) -> float
+        n_bootstrap: number of bootstrap iterations
+        confidence: CI level (default 95%)
+        seed: random seed for reproducibility
+
+    Returns:
+        (lower, upper) bounds of the confidence interval
+    """
+    rng = np.random.RandomState(seed)
+    n = len(y_true)
+    scores = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.choice(n, size=n, replace=True)
+        yt = [y_true[i] for i in idx]
+        yp = [y_pred[i] for i in idx]
+        ys = [y_scores[i] for i in idx]
+        try:
+            # Check that both classes are present
+            if len(set(yt)) < 2:
+                continue
+            s = metric_fn(yt, yp, ys)
+            scores.append(s)
+        except (ValueError, ZeroDivisionError):
+            continue
+
+    if not scores:
+        return 0.0, 0.0
+
+    alpha = (1.0 - confidence) / 2.0
+    lower = float(np.percentile(scores, 100 * alpha))
+    upper = float(np.percentile(scores, 100 * (1 - alpha)))
+    return lower, upper
+
+
+def _f1_metric(y_true, y_pred, y_scores):
+    from sklearn.metrics import f1_score
+    return f1_score(y_true, y_pred, zero_division=0)
+
+
+def _auroc_metric(y_true, y_pred, y_scores):
+    from sklearn.metrics import roc_auc_score
+    return roc_auc_score(y_true, y_scores)
 
 
 def compute_metrics(
@@ -52,6 +117,8 @@ def compute_metrics(
     y_pred: List[int],
     y_scores: List[float],
     latencies: List[float],
+    compute_ci: bool = False,
+    n_bootstrap: int = 1000,
 ) -> ClassificationMetrics:
     """Compute classification metrics from predictions and ground truth."""
     from sklearn.metrics import (
@@ -68,6 +135,14 @@ def compute_metrics(
     except ValueError:
         auroc = 0.0
 
+    f1_lo, f1_hi = 0.0, 0.0
+    auroc_lo, auroc_hi = 0.0, 0.0
+    if compute_ci and len(y_true) > 10:
+        f1_lo, f1_hi = bootstrap_ci(y_true, y_pred, y_scores, _f1_metric,
+                                     n_bootstrap=n_bootstrap)
+        auroc_lo, auroc_hi = bootstrap_ci(y_true, y_pred, y_scores, _auroc_metric,
+                                           n_bootstrap=n_bootstrap)
+
     return ClassificationMetrics(
         tp=tp, tn=tn, fp=fp, fn=fn,
         accuracy=accuracy_score(y_true, y_pred),
@@ -77,6 +152,10 @@ def compute_metrics(
         auroc=auroc,
         avg_latency_ms=float(np.mean(latencies)) if latencies else 0.0,
         total_examples=len(y_true),
+        f1_ci_lower=f1_lo,
+        f1_ci_upper=f1_hi,
+        auroc_ci_lower=auroc_lo,
+        auroc_ci_upper=auroc_hi,
     )
 
 
@@ -175,6 +254,7 @@ def evaluate_detector(
     detect_fn,
     texts: List[str],
     labels: List[int],
+    compute_ci: bool = True,
 ) -> ClassificationMetrics:
     """
     Evaluate a detector on a labeled dataset.
@@ -184,7 +264,7 @@ def evaluate_detector(
     y_pred = [r.predicted_label for r in results]
     y_scores = [r.raw_score for r in results]
     latencies = [r.latency_ms for r in results]
-    return compute_metrics(labels, y_pred, y_scores, latencies)
+    return compute_metrics(labels, y_pred, y_scores, latencies, compute_ci=compute_ci)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +274,8 @@ def evaluate_detector(
 def evaluate_verifier_defense(attack_payloads: List[str]) -> Dict:
     """
     Test the Memory Integrity Theorem's verifier against real attack payloads.
-    Each payload is treated as untrusted input that attempts to modify SOUL.md.
+    Tests each payload through ALL untrusted provenance channels (WEB, TOOL, SKILL)
+    and also tests mutable key writes with tainted data.
 
     Returns detailed results on block rate.
     """
@@ -218,34 +299,72 @@ def evaluate_verifier_defense(attack_payloads: List[str]) -> Dict:
     initial_hash = MemoryVerifier.compute_memory_integrity_hash(state.memory)
 
     blocked = 0
+    total_tests = 0
     results_detail = []
+
+    # Multi-source test: each payload tested via WEB, TOOL, and SKILL
+    untrusted_principals = [Principal.WEB, Principal.TOOL, Principal.SKILL]
+
     for payload in attack_payloads:
-        # Attempt 1: Direct SOUL.md write
-        proposal = MemoryItem(
-            key="SOUL.md",
+        for principal in untrusted_principals:
+            total_tests += 1
+            # Attempt 1: Direct SOUL.md write (immutable target)
+            proposal = MemoryItem(
+                key="SOUL.md",
+                value=payload,
+                provenance=principal,
+                tainted=True,
+            )
+            allowed, reason = verifier.verify_write_proposal(
+                proposal, state.memory, state.beliefs
+            )
+            if not allowed:
+                blocked += 1
+            results_detail.append({
+                "payload_prefix": payload[:80],
+                "principal": principal.value,
+                "target": "SOUL.md",
+                "blocked": not allowed,
+                "reason": reason,
+            })
+
+        # Also test mutable key write with tainted data
+        total_tests += 1
+        mutable_proposal = MemoryItem(
+            key="user_prefs",
             value=payload,
             provenance=Principal.WEB,
             tainted=True,
         )
-        allowed, reason = verifier.verify_write_proposal(
-            proposal, state.memory, state.beliefs
+        allowed_m, reason_m = verifier.verify_write_proposal(
+            mutable_proposal, state.memory, state.beliefs
         )
-        if not allowed:
+        if not allowed_m:
             blocked += 1
         results_detail.append({
             "payload_prefix": payload[:80],
-            "blocked": not allowed,
-            "reason": reason,
+            "principal": "WEB",
+            "target": "user_prefs (mutable)",
+            "blocked": not allowed_m,
+            "reason": reason_m,
         })
 
     final_hash = MemoryVerifier.compute_memory_integrity_hash(state.memory)
 
+    # Audit log stats
+    audit_entries = len(state.memory.audit_log)
+    audit_rejected = len(state.memory.audit_log.get_rejected())
+
     return {
         "total_payloads": len(attack_payloads),
+        "total_tests": total_tests,
         "blocked": blocked,
-        "block_rate": blocked / len(attack_payloads) if attack_payloads else 0,
+        "block_rate": blocked / total_tests if total_tests else 0,
         "memory_integrity_preserved": initial_hash == final_hash,
         "soul_md_unchanged": state.memory.get("SOUL.md").value == soul.value,
+        "provenance_channels_tested": [p.value for p in untrusted_principals],
+        "audit_log_entries": audit_entries,
+        "audit_log_rejections": audit_rejected,
         "details": results_detail,
     }
 
@@ -312,7 +431,7 @@ def evaluate_cross_session_isolation(num_sessions: int = 50) -> Dict:
             sid_a = "session_{:04d}".format(i)
             sid_b = "session_{:04d}".format(j)
             isolated, leaked_keys = verifier.verify_cross_session_isolation(
-                store, sid_a, sid_b, set()
+                store, sid_a, sid_b, {"api_secret"}
             )
             isolation_results.append(isolated)
 
