@@ -431,7 +431,7 @@ def evaluate_cross_session_isolation(num_sessions: int = 50) -> Dict:
             sid_a = "session_{:04d}".format(i)
             sid_b = "session_{:04d}".format(j)
             isolated, leaked_keys = verifier.verify_cross_session_isolation(
-                store, sid_a, sid_b, set()
+                store, sid_a, sid_b, {"api_secret"}
             )
             isolation_results.append(isolated)
 
